@@ -11,7 +11,7 @@ import argparse
 import sys
 import time
 
-from score_all_dates import update_latest_date_score
+from score_all_dates import ensure_latest_available_score
 
 
 def parse_args():
@@ -32,7 +32,7 @@ def main():
     t0 = time.time()
 
     try:
-        update_latest_date_score(args.date)
+        ensure_latest_available_score(args.date)
         print(f"Daily sync finished in {time.time() - t0:.2f}s")
         return 0
     except Exception as exc:

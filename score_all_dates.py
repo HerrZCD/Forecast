@@ -39,38 +39,7 @@ def _ensure_scores_table(con):
     )
 
 
-def update_latest_date_score(run_date=None):
-    """
-    仅更新指定日期（默认今天）的分数。
-    """
-    target_date = pd.to_datetime(run_date).date() if run_date is not None else _date.today()
-
-    print("=" * 60)
-    print(f"Incremental Scoring: target_date={target_date}")
-    print("=" * 60)
-
-    # 1. 加载数据
-    (feat_array, sector_array, target_array, univ_mask, macro_array,
-     all_dates, all_symbols, num_sectors, date2idx) = load_and_prepare_data()
-
-    # 2. 判断目标日期是否有数据
-    di = date2idx.get(np.datetime64(target_date))
-    if di is None:
-        print(f"Skip: {target_date} not found in market data calendar.")
-        return
-
-    # 3. 判断是否满足打分条件
-    if di < SEQ_LEN - 1:
-        print(f"Skip: {target_date} does not have enough history for seq_len={SEQ_LEN}.")
-        return
-    if np.isnan(macro_array[di]).any():
-        print(f"Skip: macro data is missing on {target_date}.")
-        return
-    if univ_mask[di].sum() < 5:
-        print(f"Skip: insufficient universe size on {target_date}.")
-        return
-
-    # 4. 加载模型
+def _load_model(num_sectors):
     model = PortfolioMASTER(
         num_features=NUM_FEATURES, num_sectors=num_sectors, macro_dim=MACRO_DIM,
         d_model=D_MODEL, n_heads=N_HEADS, d_ff=D_FF, dropout=DROPOUT,
@@ -81,18 +50,52 @@ def update_latest_date_score(run_date=None):
         print(f"Model successfully loaded from {MODEL_PATH}")
     except FileNotFoundError:
         print(f"Error: {MODEL_PATH} not found.")
-        return
+        return None
 
     model.eval()
+    return model
 
-    # 5. 单日打分
+
+def _find_latest_eligible_di(all_dates, macro_array, univ_mask, target_date):
+    target_ts = np.datetime64(target_date)
+    eligible_di = None
+
+    for di in range(len(all_dates) - 1, -1, -1):
+        current_date = np.datetime64(all_dates[di])
+        if current_date > target_ts:
+            continue
+        if di < SEQ_LEN - 1:
+            continue
+        if np.isnan(macro_array[di]).any():
+            continue
+        if univ_mask[di].sum() < 5:
+            continue
+        eligible_di = di
+        break
+
+    return eligible_di
+
+
+def _score_and_save_one_date(
+    model,
+    feat_array,
+    sector_array,
+    target_array,
+    univ_mask,
+    macro_array,
+    all_dates,
+    all_symbols,
+    di,
+):
+    target_date = pd.to_datetime(all_dates[di]).date()
+
     ds = CrossSectionalDataset(
         feat_array, sector_array, target_array, univ_mask, macro_array, [di]
     )
     sample = ds[0]
     if sample is None:
         print(f"Skip: sample is None on {target_date}.")
-        return
+        return 0
 
     with torch.no_grad():
         x_num, x_cat, m_vec, tgt, msk = [s.to(DEVICE) for s in sample]
@@ -116,14 +119,13 @@ def update_latest_date_score(run_date=None):
 
     if not records:
         print(f"Skip: no records generated on {target_date}.")
-        return
+        return 0
 
-    # 6. 写入 DuckDB
     df_day = pd.DataFrame(records)
     df_day["date"] = pd.to_datetime(df_day["date"]).dt.date
 
     con = duckdb.connect(DB_PATH)
-    con.execute("SET memory_limit='256MB'") # 严格限制 DuckDB 内存
+    con.execute("SET memory_limit='256MB'")
     _ensure_scores_table(con)
     con.execute("DELETE FROM tft_alpha_scores WHERE date = ?", [target_date])
     con.register("df_day", df_day)
@@ -133,8 +135,115 @@ def update_latest_date_score(run_date=None):
         SELECT date, ticker, raw_score, rank_score FROM df_day
         """
     )
+    inserted = con.execute(
+        "SELECT COUNT(*) FROM tft_alpha_scores WHERE date = ?", [target_date]
+    ).fetchone()[0]
     con.close()
-    print(f"SUCCESS: {target_date}")
+
+    print(f"SUCCESS: {target_date} ({inserted} rows)")
+    return inserted
+
+
+def update_latest_date_score(run_date=None):
+    """
+    仅更新指定日期（默认今天）的分数。
+    """
+    target_date = pd.to_datetime(run_date).date() if run_date is not None else _date.today()
+
+    print("=" * 60)
+    print(f"Incremental Scoring: target_date={target_date}")
+    print("=" * 60)
+
+    # 1. 加载数据
+    (feat_array, sector_array, target_array, univ_mask, macro_array,
+     all_dates, all_symbols, num_sectors, date2idx) = load_and_prepare_data()
+
+    # 2. 判断目标日期是否有数据
+    di = date2idx.get(np.datetime64(target_date))
+    if di is None:
+        print(f"Skip: {target_date} not found in market data calendar.")
+        return 0
+
+    # 3. 判断是否满足打分条件
+    if di < SEQ_LEN - 1:
+        print(f"Skip: {target_date} does not have enough history for seq_len={SEQ_LEN}.")
+        return 0
+    if np.isnan(macro_array[di]).any():
+        print(f"Skip: macro data is missing on {target_date}.")
+        return 0
+    if univ_mask[di].sum() < 5:
+        print(f"Skip: insufficient universe size on {target_date}.")
+        return 0
+
+    # 4. 加载模型
+    model = _load_model(num_sectors)
+    if model is None:
+        return 0
+
+    return _score_and_save_one_date(
+        model,
+        feat_array,
+        sector_array,
+        target_array,
+        univ_mask,
+        macro_array,
+        all_dates,
+        all_symbols,
+        di,
+    )
+
+
+def ensure_latest_available_score(run_date=None):
+    """
+    确保截至指定日期（默认今天），最近一个可打分交易日已经有 score。
+    若今天非交易日，则自动回退到最近一个交易日。
+    若库里该日期没有 score，则补算；有则跳过。
+    """
+    target_date = pd.to_datetime(run_date).date() if run_date is not None else _date.today()
+
+    print("=" * 60)
+    print(f"Daily Sync: target_date={target_date}")
+    print("=" * 60)
+
+    (feat_array, sector_array, target_array, univ_mask, macro_array,
+     all_dates, all_symbols, num_sectors, date2idx) = load_and_prepare_data()
+
+    di = _find_latest_eligible_di(all_dates, macro_array, univ_mask, target_date)
+    if di is None:
+        print(f"Skip: no eligible trading day found on or before {target_date}.")
+        return 0
+
+    score_date = pd.to_datetime(all_dates[di]).date()
+    if score_date != target_date:
+        print(f"Resolved latest eligible trading day: {score_date}")
+
+    con = duckdb.connect(DB_PATH)
+    con.execute("SET memory_limit='256MB'")
+    _ensure_scores_table(con)
+    existing = con.execute(
+        "SELECT COUNT(*) FROM tft_alpha_scores WHERE date = ?", [score_date]
+    ).fetchone()[0]
+    con.close()
+
+    if existing > 0:
+        print(f"Skip: {score_date} already has {existing} score rows.")
+        return existing
+
+    model = _load_model(num_sectors)
+    if model is None:
+        return 0
+
+    return _score_and_save_one_date(
+        model,
+        feat_array,
+        sector_array,
+        target_array,
+        univ_mask,
+        macro_array,
+        all_dates,
+        all_symbols,
+        di,
+    )
 
 
 def main():
