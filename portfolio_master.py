@@ -18,7 +18,7 @@ from scipy.stats import spearmanr
 # ============================================================
 # 0. Configuration
 # ============================================================
-DB_PATH = "./stock_prices.duckdb"
+DB_PATH = "/home/zhangchundong/DailySync/data_loader//stock_prices.duckdb"
 SEQ_LEN = 20          # lookback window (trading days)
 FORWARD_DAYS = 5      # prediction horizon
 D_MODEL = 64           # transformer hidden dim
