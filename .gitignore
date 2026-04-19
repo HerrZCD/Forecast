@@ -1,0 +1,5 @@
+.claude/
+.conda/
+.vscode/
+__pycache__/
+stock_prices.duckdb
